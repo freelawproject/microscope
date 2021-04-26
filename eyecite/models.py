@@ -50,6 +50,9 @@ class CitationBase:
 
     token: "Token"  # token this citation came from
     index: int  # index of _token in the token list
+    # span() overrides
+    span_start: Optional[int] = None
+    span_end: Optional[int] = None
 
     def matched_text(self):
         """Text that identified this citation, such as '1 U.S. 1' or 'Id.'"""
@@ -57,7 +60,12 @@ class CitationBase:
 
     def span(self):
         """Start and stop offsets in source text for matched_text.()"""
-        return (self.token.start, self.token.end)
+        return (
+            self.span_start
+            if self.span_start is not None
+            else self.token.start,
+            self.span_end if self.span_end is not None else self.token.end,
+        )
 
 
 @dataclass(eq=True, unsafe_hash=True)
@@ -67,7 +75,7 @@ class CaseCitation(CitationBase):
     """
 
     # Core data.
-    reporter: str
+    reporter: Optional[str] = None
     page: Optional[str] = None
     volume: Optional[str] = None
 
@@ -75,12 +83,18 @@ class CaseCitation(CitationBase):
     # For a citation to F.2d, the canonical reporter is F.
     canonical_reporter: Optional[str] = None
 
-    # Supplementary data, if possible.
-    extra: Optional[str] = None
-    defendant: Optional[str] = None
+    # Supplementary data, if possible:
+    #  <plaintiff> v. <defendant>,
+    #  <matched_text> <pin_cite> <extra>
+    #  (<court> <year>)
+    #  (<parenthetical).
     plaintiff: Optional[str] = None
+    defendant: Optional[str] = None
+    pin_cite: Optional[str] = None
+    extra: Optional[str] = None
     court: Optional[str] = None
     year: Optional[int] = None
+    parenthetical: Optional[str] = None
 
     # The reporter found in the text is often different from the reporter
     # once it's normalized. We need to keep the original value so we can
@@ -199,12 +213,11 @@ class SupraCitation(CitationBase):
     # Like a Citation object, but without knowledge of the reporter or the
     # volume. Only has a guess at what the antecedent is.
     antecedent_guess: Optional[str] = None
-    page: Optional[str] = None
+    pin_cite: Optional[str] = None
     volume: Optional[str] = None
 
     def __repr__(self):
-        print_string = "%s supra, at %s" % (self.antecedent_guess, self.page)
-        return print_string
+        return "%s supra, %s" % (self.antecedent_guess, self.pin_cite)
 
 
 @dataclass(eq=True, unsafe_hash=True)
@@ -213,30 +226,15 @@ class IdCitation(CitationBase):
     citation to the document referenced immediately prior. An 'id' citation is
     unlike a regular citation object since it has no knowledge of its reporter,
     volume, or page. Instead, the only helpful information that this reference
-    possesses is a record of the tokens after the 'id' token. Those tokens
-    enable us to build a regex to match this citation later.
+    possesses is a record of the pin cite after the 'id' token.
 
     Example: "... foo bar," id., at 240
     """
 
-    after_tokens: Optional["Tokens"] = None
-    # Whether the "after tokens" comprise a page number
-    has_page: bool = False
+    pin_cite: Optional[str] = None
 
     def __repr__(self):
-        print_string = "%s %s" % (self.token, self.after_tokens)
-        return print_string
-
-    def span(self):
-        """Extend citation's span to include after_tokens, like 'Id. at 5'"""
-        if self.has_page:
-            end_offset = (
-                self.token.end
-                + sum(len(t) for t in self.after_tokens)
-                + len(self.after_tokens)
-            )
-            return (self.token.start, end_offset)
-        return super().span()
+        return "%s %s" % (self.token, self.pin_cite)
 
 
 @dataclass(eq=True, unsafe_hash=True)
@@ -264,20 +262,20 @@ class Token(UserString):
         """Return a token object based on a regular expression match.
         This gets called by TokenExtractor. By default, just use the
         entire matched string."""
-        start, end = m.span(0)
-        return cls(m[0], start + offset, end + offset)
+        start, end = m.span(1)
+        return cls(m[1], start + offset, end + offset)
 
 
 # For performance, lists of tokens can include either Token subclasses
 # or bare strings (the typical case of words that aren't
 # related to citations)
 TokenOrStr = Union[Token, str]
-Tokens = Sequence[TokenOrStr]
+Tokens = List[TokenOrStr]
 
 
 @dataclass(eq=True, frozen=True)
 class CitationToken(Token):
-    """ String matching a citation regex. """
+    """String matching a citation regex."""
 
     volume: str
     reporter: str
@@ -301,10 +299,10 @@ class CitationToken(Token):
         in their regular expressions, and "exact_editions" and
         "variation_editions" in their extra config. Pass all of that through
         to the constructor."""
-        start, end = m.span(0)
+        start, end = m.span(1)
         match_groups = m.groupdict()
         return cls(
-            m[0],
+            m[1],
             start + offset,
             end + offset,
             volume=match_groups.pop("volume", ""),
@@ -317,34 +315,27 @@ class CitationToken(Token):
 
 @dataclass(eq=True, frozen=True)
 class SectionToken(Token):
-    """ Word containing a section symbol. """
+    """Word containing a section symbol."""
 
 
 @dataclass(eq=True, frozen=True)
 class SupraToken(Token):
-    """ Word matching "supra" with or without punctuation. """
-
-    @classmethod
-    def from_match(cls, m, extra, offset=0) -> Token:
-        """Only use the captured part of the match to omit whitespace."""
-        start, end = m.span(1)
-        return cls(m[1], start + offset, end + offset)
+    """Word matching "supra" with or without punctuation."""
 
 
 @dataclass(eq=True, frozen=True)
 class IdToken(Token):
-    """ Word matching "id" or "ibid". """
+    """Word matching "id" or "ibid"."""
 
-    @classmethod
-    def from_match(cls, m, extra, offset=0) -> Token:
-        """Only use the captured part of the match to omit whitespace."""
-        start, end = m.span(1)
-        return cls(m[1], start + offset, end + offset)
+
+@dataclass(eq=True, frozen=True)
+class ParagraphToken(Token):
+    """Word matching a break between paragraphs."""
 
 
 @dataclass(eq=True, frozen=True)
 class StopWordToken(Token):
-    """ Word matching one of the STOP_TOKENS. """
+    """Word matching one of the STOP_TOKENS."""
 
     stop_word: str
     stop_tokens: ClassVar[Sequence[str]] = (
